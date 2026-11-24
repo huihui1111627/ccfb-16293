@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>木材市场并行分组聚合执行器</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>木材检尺明细 · 自适应并行分组聚合</h1>
+      <p>采样估计基数 → 本地预聚合 / 分区透传 → 两阶段状态合并；固定种子生成数据</p>
+    </div>
+    <div class="run-status">
+      <span id="statusDot" class="dot idle"></span>
+      <div>
+        <strong id="statusText">空闲</strong>
+        <div id="statusSub" class="muted">等待任务</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls">
+      <h2>任务与实时参数</h2>
+      <div class="control-grid">
+        <label class="field span2">
+          <span>数据场景</span>
+          <select id="scenario"></select>
+        </label>
+        <label class="field">
+          <span>运行策略</span>
+          <select id="mode">
+            <option value="adaptive">自适应</option>
+            <option value="always_pre">总是预聚合</option>
+            <option value="never_pre">从不预聚合（直接透传）</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button id="runBtn" class="primary">运行一次</button>
+          <button id="benchBtn">统计三种策略耗时/内存</button>
+          <button id="verifyBtn">与朴素实现逐组校验</button>
+        </div>
+
+        <label class="field">
+          <span>线程数 <b id="threadsVal">8</b></span>
+          <input id="threads" type="range" min="1" max="32" step="1" />
+        </label>
+        <label class="field">
+          <span>每线程本地表上限（组） <b id="localVal">50,000</b></span>
+          <input id="local" type="range" min="100" max="1000000" step="100" />
+        </label>
+        <label class="field">
+          <span>基础分区数 <b id="partitionsVal">8</b> · 实际 <b id="effectiveVal">0</b></span>
+          <input id="partitions" type="range" min="1" max="128" step="1" />
+        </label>
+        <label class="field">
+          <span>高唯一键阈值 <b id="thresholdVal">0.72</b></span>
+          <input id="threshold" type="range" min="0.35" max="0.95" step="0.01" />
+        </label>
+        <label class="field checkbox">
+          <input id="autoPartitions" type="checkbox" />
+          <span>分组极多时自动增加分区（上限 512）</span>
+        </label>
+        <label class="field">
+          <span>每批行数 <b id="batchVal">100,000</b></span>
+          <input id="batchRows" type="range" min="10000" max="300000" step="10000" />
+        </label>
+      </div>
+      <div id="verifyBanner" class="banner hidden"></div>
+      <div id="errorBanner" class="banner error hidden"></div>
+    </section>
+
+    <section class="panel metric-cards">
+      <div class="card"><span>结果分组</span><strong id="groupCount">0</strong><em id="groupHint">—</em></div>
+      <div class="card"><span>已处理明细</span><strong id="rowCount">0</strong><em id="throughput">— rows/s</em></div>
+      <div class="card"><span>运行耗时</span><strong id="elapsed">0 ms</strong><em id="partitionHint">—</em></div>
+      <div class="card"><span>峰值 Go 堆</span><strong id="peakHeap">—</strong><em id="allocDelta">累计分配 —</em></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-title">
+        <h2>内存占用曲线</h2>
+        <div class="legend">
+          <span><i class="line heap"></i>HeapAlloc</span>
+          <span><i class="line tracked"></i>估算引擎状态/键</span>
+        </div>
+      </div>
+      <canvas id="memChart" width="1200" height="280"></canvas>
+    </section>
+
+    <section class="panel">
+      <h2>每个线程的本地哈希表与状态</h2>
+      <div id="workers" class="workers"></div>
+    </section>
+
+    <div class="two-col">
+      <section class="panel">
+        <h2>批次采样与预聚合/透传决策</h2>
+        <div class="table-wrap batches">
+          <table>
+            <thead><tr>
+              <th>#</th><th>行数</th><th>抽样/唯一</th><th>样本唯一率</th><th>Chao 估计批内组</th>
+              <th>决策</th><th>原因</th><th>耗时</th>
+            </tr></thead>
+            <tbody id="batchRowsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>合并阶段分区数据量</h2>
+        <div id="partitionBars" class="partition-bars"></div>
+        <div class="table-wrap partitions">
+          <table>
+            <thead><tr><th>分区</th><th>组数</th><th>消息数</th><th>来源行数</th><th>估算字节</th><th>占比</th></tr></thead>
+            <tbody id="partitionBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel">
+      <h2>三种策略耗时与内存统计</h2>
+      <p class="muted">同一固定种子场景，依次运行自适应、总是预聚合、从不预聚合；每次运行前执行 GC。峰值为运行期间采样到的 Go HeapAlloc。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>策略</th><th>耗时</th><th>吞吐</th><th>分组数</th><th>峰值堆</th><th>峰值增量</th>
+            <th>累计分配</th><th>GC 后存活堆</th><th>分区</th><th>批次决策</th>
+          </tr></thead>
+          <tbody id="benchBody"><tr><td colspan="10" class="muted">尚未运行基准统计。</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>本次结果材积前 10 名分组（最终 Top N）</h2>
+      <ol id="topGroups" class="top-groups"><li class="muted">运行后显示。</li></ol>
+    </section>
+
+    <section class="panel notes">
+      <h2>规则与实现说明</h2>
+      <ul>
+        <li>平均值两阶段传 <code>Sum + Count</code>；不同值个数传精确集合/单值中间状态，最后才计算 <code>len</code>。</li>
+        <li>浮点键把 <code>-0/+0</code> 规范化为同一 bits，所有 NaN payload 规范化为同一组。</li>
+        <li>字符串键只复制 string header；哈希逐字节读取原字符串，比较使用 Go 字符串原始字节比较。测试断言底层指针不变。</li>
+        <li>估计分组很少时降为单线程全表汇总；高基数时跳过本地表并按 <code>hash(key)%partition</code> 透传；极多组自动扩分区，参数改动在下一批边界安全 reshard。</li>
+        <li>检测到输入全程按键非递减时进入有序流：组切换即输出，不建哈希表；若发现逆序会自动重启为哈希路径。</li>
+      </ul>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
